@@ -16,7 +16,7 @@ Bushu can be configured in interactive mode or using a configuration file.
 
 ### Command line arguments
 
-    bushu \[/path/to/configuration/file\] \[command \[args...\]\]
+    bushu [/path/to/configuration/file] [command [args...]]
     
 If no commands are specified, Bushu will start in interactive mode.
 You can print available commands using _help_ (also available in interactive mode).
