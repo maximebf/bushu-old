@@ -1,0 +1,528 @@
+#!/bin/bash
+
+# 
+# The MIT License
+#
+# Copyright (c) 2010 Novaden
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+# 
+
+#--------
+ME=$(hostname -f)
+#--------
+
+SCRIPTNAME=/usr/bin/bushu
+ROLES_DIR=/usr/share/bushu/roles
+CONFIG_FILE=/etc/bushu.conf
+REMOTE_ROLES_DIR=$ROLES_DIR
+REMOTE_CONFIG_FILE=$CONFIG_FILE
+
+TRUE=0
+FALSE=1
+SESSION_CONFIG_FILE=`tempfile`
+BE_QUIET=$FALSE
+
+CURRENT_SERVER=
+SERVERS=()
+DEFAULT_ROLES=()
+EXEC_BEFORE_DEPLOY=()
+EXEC_AFTER_DEPLOY=()
+
+cred="\033[31m" 
+cblue="\033[34m"
+cyellow="\033[33m"
+cgreen="\033[32m"
+cgrey="\033[1;30m"
+creset="\033[0m"
+
+# ----------------------------------------------------------------------
+# Misc functions
+
+printinfo() {
+    $(exit $BE_QUIET) && return
+    echo -e "  ${cgreen}* $*$creset"
+}
+
+printerror() {
+    echo -e "  ${cred}! $*$creset" >&2
+}
+
+import_libs() {
+    for lib in $(ls -d $ROLES_DIR/*/*.lib 2> /dev/null)
+    do
+        printinfo "Importing library `basename $(dirname $lib)`/`basename $lib`"
+        source $lib
+    done
+}
+
+is_subrole() {
+    test $(expr index "$1" "/") -gt 0
+    return $?
+}
+
+get_parent_role_name() {
+    echo $1 | cut -d'/' -f1
+}
+
+get_role_name() {
+    echo $1 | cut -d'/' -f2
+}
+
+# ----------------------------------------------------------------------
+# Config functions
+
+load_config() {
+    printinfo "Loading config file $1"
+    source $1
+}
+
+save_config() {
+    printinfo "Saving config to $1"
+    cp $SESSION_CONFIG_FILE $1
+}
+
+reset_config() {
+    printinfo "Resetting current configuration"
+    echo > $SESSION_CONFIG_FILE
+    SERVERS=()
+}
+
+commit_config() {
+    printinfo "Commiting current configuration to $CONFIG_FILE"
+    cat $SESSION_CONFIG_FILE > $CONFIG_FILE
+}
+
+setconf() {
+    eval "$1=$2"
+    echo "setconf $*" >> $SESSION_CONFIG_FILE
+    if [ "$1" = "ROLES_DIR" ]; then
+        REMOTE_ROLES_DIR=$2
+    elif [ "$1" = "CONFIG_FILE" ]; then
+        REMOTE_CONFIG_FILE=$2
+    fi
+}
+
+# ----------------------------------------------------------------------
+# SSH functions
+
+is_host_unreachable() {
+    test -n "`ping -c 1 $1 | grep "Destination Host Unreachable"`"
+    return $?
+}
+
+start_ssh_session() {
+    printinfo "Contacting $1"
+    ssh -M -S /tmp/$1.sshsession $1 "exit"
+    test $? -gt 0 && printerror "Failed starting an ssh session to $1" && return 1
+    return 0
+}
+
+rsend() {
+    local server=$1 src=$2 dest=$3; shift 3
+    test -z "$dest" && dest="/tmp"
+    scp $* -q -o ControlPath=/tmp/$server.sshsession $src root@$server:$dest
+    test $? -gt 0 && printerror "Failed sending \"$src\" to $server" && return 1
+    return 0
+}
+
+rexec() {
+    local server=$1
+    shift
+    ssh -S /tmp/$server.sshsession root@$server "$*"
+    test $? -gt 0 && printerror "Failed executing \"$*\" on $server" && return 1
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Installation functions
+
+install_role() {
+    local role=$1 parent_role=$(get_parent_role_name $1) role_dir=$ROLES_DIR/$1
+    
+    if is_subrole $role; then
+        local install_parent_role=0
+        for installed_role in $(list_roles_from_server $ME)
+        do
+            test "$installed_role" = "$role" && break
+            test "`get_parent_role_name $installed_role`" = "$parent_role" && install_parent_role=1 && break
+        done
+        $(exit $install_parent_role) && install_role $parent_role
+    fi
+    
+    printinfo "Installing role $role"
+    (
+    cd $role_dir
+    for task in $(eval ls -v *.task 2> /dev/null)
+    do
+        if [ "$task" = "uninstall.task" ] || [ "$task" = "deploy.task" ]; then continue; fi
+        source $task
+    done
+    )
+}
+
+uninstall_role() {
+    local role=$1 role_dir=$ROLES_DIR/$1
+    if [ -e $role_dir/uninstall.task ]; then
+        printinfo "Executing uninstallation task for role $role"
+        (cd $role_dir && source uninstall.task)
+    fi
+}
+
+install_all_roles() {
+    for role in $(ls -d $ROLES_DIR/*/)
+    do
+        install_role $(basename $role)
+    done
+}
+
+# ----------------------------------------------------------------------
+# Deployment functions
+
+is_server_setuped() {
+    return $(rexec $1 "(if [ -e $SCRIPTNAME ]; then echo 0; else echo 1; fi)")
+}
+
+setup_server() {
+    local server=$1 tmp=`tempfile`
+    printinfo "Preparing server $server for deployment"
+    cat $0 | sed "4s/.*/ME=$server/" > $tmp
+    rexec $server "(mkdir -p $REMOTE_ROLES_DIR 2> /dev/null)"
+    rsend $server $tmp $SCRIPTNAME
+    rexec $server "(chmod +x $SCRIPTNAME)"
+}
+
+deploy_role() {
+    local server=$1 role=$2 parent_role=$(get_parent_role_name $2) role_dir=$ROLES_DIR/$2
+    
+    if [ -e $role_dir/deploy.task ]; then
+        printinfo "Executing pre-deployment task of role $role"
+        (cd $role_dir && source deploy.task)
+    fi
+    
+    printinfo "Deploying role $parent_role to $server"
+    rsend $server $ROLES_DIR/$parent_role $REMOTE_ROLES_DIR -r
+    
+    #rexec $server "(tar -xjf /tmp/$role.role -C $INSTALL_DIR)"
+    test $? -gt 0 && return 1
+    
+    rexec $server "bash $SCRIPTNAME install_role $role"
+    test $? -gt 0 && printerror "Failed installing role $role on $server"
+}
+
+deploy_server() {
+    local server=$1; shift
+    local roles=(${DEFAULT_ROLES[*]} $*) installed_roles=() roles_to_install=() roles_to_remove=()
+    CURRENT_SERVER=$server
+    
+    if $(is_host_unreachable $server); then
+        printerror "Jumping deployment of $server because the host is unreachable"
+        return 1
+    fi
+    
+    start_ssh_session $server
+    test $? -gt 0 && printerror "Jumping deployment of $server because of failure to connect" && return 1
+    
+    if $(is_server_setuped $server); then
+        printinfo "Obtaining server information from $server"
+        installed_roles=($(rexec $server "(bash $SCRIPTNAME -q list_server_roles $server)"))
+        for role in ${roles[*]}
+        do
+            for installed_role in ${installed_roles[*]}
+            do
+                test "$installed_role" = "$role" && continue 2
+            done
+            roles_to_install+=($role)
+        done
+        for installed_role in ${installed_roles[*]}
+        do
+            for role in ${roles[*]}
+            do
+                test "$installed_role" = "$role" && continue 2
+            done
+            roles_to_remove+=($installed_role)
+        done
+    else
+        setup_server $server
+        roles_to_install=(${roles[*]})
+    fi
+    
+    for i in $(seq 0 $((${#EXEC_BEFORE_DEPLOY[@]} - 1)))
+    do
+        test $(echo ${EXEC_BEFORE_DEPLOY[$i]} | cut -d':' -f1) != "$server" && continue
+        source $(echo ${EXEC_BEFORE_DEPLOY[$i]} | cut -d':' -f2)
+    done
+    
+    printinfo "Publishing current configuration to $server"
+    rsend $server $SESSION_CONFIG_FILE $REMOTE_CONFIG_FILE
+    
+    if [ ${#roles_to_remove[@]} -gt 0 ]; then
+        for role in ${roles_to_remove[*]}
+        do
+            rexec $server "(bash $SCRIPTNAME uninstall_role $role)"
+        done
+    fi
+    
+    if [ ${#roles_to_install[@]} -gt 0 ]; then
+        for role in ${roles_to_install[*]}
+        do
+            deploy_role $server $role
+        done
+    fi
+    
+    for i in $(seq 0 $((${#EXEC_AFTER_DEPLOY[@]} - 1)))
+    do
+        test $(echo ${EXEC_AFTER_DEPLOY[$i]} | cut -d':' -f1) != "$server" && continue
+        source $(echo ${EXEC_AFTER_DEPLOY[$i]} | cut -d':' -f2)
+    done
+    
+    printinfo "End of deployment for $server"
+}
+
+# ----------------------------------------------------------------------
+# Configuration management functions
+
+add_server() {
+    local server=$1; shift
+    SERVERS+=("$server;$*")
+    echo "add_server $server $*" >> $SESSION_CONFIG_FILE
+}
+
+list_servers() {
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local server=$(echo ${SERVERS[$i]} | cut -d';' -f1) roles=$(echo ${SERVERS[$i]} | cut -d';' -f2)
+        echo -e "  $cyellow$server$creset : ${DEFAULT_ROLES[*]} $roles"
+    done
+}
+
+get_server_with_role() {
+    local role=$1
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local server=$(echo ${SERVERS[$i]} | cut -d';' -f1) roles=$(echo ${SERVERS[$i]} | cut -d';' -f2)
+        for j in $(seq 0 $((${#roles[@]} - 1)))
+        do
+            if [ "${roles[$j]}" = "$role" ]; then
+                echo $server
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+add_role() {
+    local server=$1; shift
+    
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local s=$(echo ${SERVERS[$i]} | cut -d';' -f1) r=$(echo ${SERVERS[$i]} | cut -d';' -f2)
+        if [ "$server" = "$s" ]; then
+            SERVERS[$i]="$s;$r $*"
+            break
+        fi
+    done
+    
+    echo "add_role $server $*" >> $SESSION_CONFIG_FILE
+}
+
+add_default_role() {
+    DEFAULT_ROLES+=($*)
+    echo "add_default_role $*" >> $SESSION_CONFIG_FILE
+}
+
+list_roles() {
+    printinfo "Available roles:"
+    for role in $(ls $ROLES_DIR/*.role)
+    do
+        echo "   " $(basename $role | sed 's/\.role$//g')
+    done
+}
+
+list_default_roles() {
+    printinfo "Default roles:"
+    for role in ${DEFAULT_ROLES[*]}; do echo "   " $role; done
+}
+
+list_server_roles() {
+    local server=$1
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local s=$(echo ${SERVERS[$i]} | cut -d';' -f1) roles=$(echo ${SERVERS[$i]} | cut -d';' -f2)
+        if [ "$s" = "$server" ]; then
+            echo $DEFAULT_ROLES $roles
+            return 0
+        fi
+    done
+    return 1
+}
+
+exec_before_deploy() {
+    EXEC_BEFORE_DEPLOY+=($*)
+}
+
+exec_before_deploy_server() {
+    EXEC_BEFORE_DEPLOY+=("$1:$2")
+}
+
+exec_after_deploy() {
+    EXEC_AFTER_DEPLOY+=($*)
+}
+
+exec_after_deploy_server() {
+    EXEC_AFTER_DEPLOY+=("$1:$2")
+}
+
+# ----------------------------------------------------------------------
+# Main functions
+
+status() {
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local server=$(echo ${SERVERS[$i]} | cut -d';' -f1) \
+              roles="${DEFAULT_ROLES[*]} `echo ${SERVERS[$i]} | cut -d';' -f2`" \
+              status="${cred}NOT INSTALLED${creset}" \
+              installed_roles= ip=
+              
+        if $(is_host_unreachable $server); then
+            status="${cred}UNREACHABLE${creset}"
+        else
+            ip=$(ping -c1 $server | grep PING | cut -d' ' -f3)
+            if $(is_server_setuped $server); then
+                installed_roles=$(rexec $server "(bash $SCRIPTNAME -q list_server_roles $server)")
+                status="${cgreen}OK${creset}"
+                if [ "`echo $roles | sed 's/ //g'`" != "`echo $installed_roles | sed 's/ //g'`" ]; then
+                    status="${cred}NEED UPDATE${creset}"
+                fi
+            fi
+        fi
+        
+        echo -e "  $cyellow* $server $ip$creset"
+        echo -e "      ${cgrey}Status${creset}: $status"
+        echo -e "      ${cgrey}Roles${creset} : $roles"
+        echo -e "      ${cgrey}Installed${creset} : $installed_roles"
+    done
+}
+
+deploy() {
+    if [ -n "$1" ]; then
+        load_config $1
+    fi
+    
+    for i in $(seq 0 $((${#EXEC_BEFORE_DEPLOY[@]} - 1)))
+    do
+        local script=${EXEC_BEFORE_DEPLOY[$i]}
+        test $(expr index "$script" ":") -gt 0 && continue
+        source $script
+    done
+    
+    for i in $(seq 0 $((${#SERVERS[@]} - 1)))
+    do
+        local server=$(echo ${SERVERS[$i]} | cut -d';' -f1) roles=$(echo ${SERVERS[$i]} | cut -d';' -f2)
+        deploy_server $server $roles
+    done
+    
+    for i in $(seq 0 $((${#EXEC_AFTER_DEPLOY[@]} - 1)))
+    do
+        local script=${EXEC_AFTER_DEPLOY[$i]}
+        test $(expr index "$script" ":") -gt 0 && continue
+        source $script
+    done
+}
+
+help() {
+    echo "Bushu Deployment Tool - Version 1.0"
+    echo "Use \"help\" to see a list of available commands ($0 help)"
+    echo
+    echo -e "List of deployment functions:
+  ${cyellow}start_ssh_session ${cgrey}server${creset}
+    Start an ssh session that can be reused with other ssh functions
+  ${cyellow}rsend ${cgrey}server file [destination] [scp options]${creset}
+    Send a file
+  ${cyellow}rexec ${cgrey}server command${creset}
+    Execute a command on a remote server
+  ${cyellow}load_config ${cgrey}filename${creset}
+    Load a configuration file
+  ${cyellow}save_config ${cgrey}filename${creset}
+    Save configuration to a file
+  ${cyellow}reset_config${creset}
+    Reset the configuration
+  ${cyellow}commit_config${creset}
+    Commit the current configuration to \$CONFIG_FILE
+  ${cyellow}setconf ${cgrey}key value${creset}
+    Set a configuration variable which will be commited
+  ${cyellow}is_server_setuped ${cgrey}server${creset}
+    Check if a server has already been setuped
+  ${cyellow}setup_server ${cgrey}server${creset}
+    Setup the specified server
+  ${cyellow}deploy_role ${cgrey}server role${creset}
+    Deploy a role to a remote server
+  ${cyellow}deploy_server ${cgrey}server role[ role[ ...]]${creset}
+    Deploy roles to a remote server
+  ${cyellow}add_server ${cgrey}server role[ role[ ...]]${creset}
+    Add a server to deploy to
+  ${cyellow}get_server_with_role ${cgrey}role${creset}
+    Return the first server with the specified role
+  ${cyellow}list_servers${creset}
+    List servers and their associated roles from the current configuration
+  ${cyellow}add_role ${cgrey}server role[ role[ ...]]${creset}
+    Add a role to deploy on the specified server
+  ${cyellow}add_default_role ${cgrey}server role[ role[ ...]]${creset}
+    Add a default role to deploy on all servers
+  ${cyellow}list_roles${creset}
+    List available roles
+  ${cyellow}list_server_roles ${cgrey}server${creset}
+    List roles of the specified server
+  ${cyellow}list_default_roles${creset}
+    List default roles
+  ${cyellow}status${creset}
+    Show current deployment status
+  ${cyellow}deploy ${cgrey}[config_filename]${creset}
+    Start the deployment to all server"
+}
+
+console() {
+    for (( ; ; ))
+    do
+        echo -ne "${cgrey}bushu>${creset} "
+        read cmd
+        $cmd
+    done
+}
+
+# ----------------------------------------------------------------------
+# Main
+
+if [ "$1" = "-q" ]; then BE_QUIET=$TRUE; shift; fi
+
+test -e $CONFIG_FILE && source $CONFIG_FILE
+if [ $# -gt 0 ] && [ -e $1 ]; then
+    load_config $1
+    shift
+fi
+
+import_libs
+
+if [ $# -gt 0 ]; then
+    $*
+else
+    console
+fi
+
